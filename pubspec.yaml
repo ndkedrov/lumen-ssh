@@ -17,11 +17,14 @@ dependencies:
   file_picker: ^8.1.2
   encrypt: ^5.0.3
   crypto: ^3.0.6
+  ffi: ^2.1.0
   desktop_drop: ^0.5.0
   cross_file: ^0.3.4
   window_manager: ^0.4.3
 
 dev_dependencies:
+  flutter_test:
+    sdk: flutter
   flutter_lints: ^4.0.0
 
 flutter:
