@@ -18,6 +18,9 @@ import 'file_editor.dart';
 import 'snippets.dart';
 import 'monitor_panel.dart';
 import 'secure_store.dart';
+import 'secrets.dart';
+import 'device_key.dart';
+import 'key_switch.dart';
 import 'ssh_keygen.dart';
 import 'tunnels.dart';
 
@@ -53,6 +56,8 @@ class _HomePageState extends State<HomePage> {
   Timer? _toastTimer;
 
   bool _broadcast = false;
+  String? _devicePub; // публічний ключ цього ПК, якщо вже створено
+  static const _keyDeclinedPref = 'lumen_key_declined';
   String? _master;
   bool _masterEnabled = false;
   final Map<int, TunnelManager> _tunnels = {};
@@ -94,7 +99,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _loadServers() async {
-    final list = _dedupe(await ServerStore.load());
+    final stored = _dedupe(await ServerStore.load());
     final prefs = await SharedPreferences.getInstance();
     final check = prefs.getString('lumen_master_check');
     if (check != null) {
@@ -109,36 +114,23 @@ class _HomePageState extends State<HomePage> {
           _toast('Невірний майстер-пароль');
         }
       }
-      if (_master != null) {
-        for (final s in list) {
-          if (s.password.startsWith('enc:')) {
-            s.password =
-                SecureStore.decryptString(s.password.substring(4), _master!) ??
-                    '';
-          }
-        }
-      }
     }
-    _servers = list;
+    final failed = <String>[];
+    _servers =
+        stored.map((s) => Secrets.openServer(s, _master, failed)).toList();
+    // Записані відкритим текстом секрети (старі версії) тут же йдуть під DPAPI.
     await _saveServers();
+    if (failed.isNotEmpty) {
+      _toast('Не вдалося розшифрувати секретів: ${failed.length} — '
+          'введіть їх заново в налаштуваннях сервера');
+    }
     if (mounted) setState(() {});
+    _loadDeviceKey();
   }
 
-  // Зберегти сервери (шифруючи паролі, якщо ввімкнено майстер-пароль).
-  Future<void> _saveServers() async {
-    if (_master == null) {
-      await ServerStore.save(_servers);
-      return;
-    }
-    final enc = _servers.map((s) {
-      final c = s.copy();
-      if (c.password.isNotEmpty && !c.password.startsWith('enc:')) {
-        c.password = 'enc:${SecureStore.encryptString(c.password, _master!)}';
-      }
-      return c;
-    }).toList();
-    await ServerStore.save(enc);
-  }
+  // Зберегти сервери: секрети — під DPAPI (і майстер-паролем, якщо ввімкнено).
+  Future<void> _saveServers() => ServerStore.save(
+      _servers.map((s) => Secrets.sealServer(s, _master)).toList());
 
   Future<void> _setupMaster() async {
     if (_masterEnabled) {
@@ -437,6 +429,7 @@ class _HomePageState extends State<HomePage> {
       _refreshFiles();
       _focusActive();
       _toast('Підключено: ${server.name.isEmpty ? server.host : server.name}');
+      _maybeOfferKey(session);
     } catch (e) {
       _focus.remove(session.id)?.dispose();
       setState(() => _sessions.remove(session));
@@ -1107,6 +1100,204 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
   }
 
+  // -------------------- Вхід ключем цього ПК --------------------
+  Future<void> _loadDeviceKey() async {
+    _devicePub = await DeviceKey.publicLine();
+    if (mounted) setState(() {});
+  }
+
+  // Збережений запис сервера, з якого відкрито сесію (сесія може мати копію).
+  Server? _stored(Server s) {
+    for (final x in _servers) {
+      if (x.id.isNotEmpty && x.id == s.id) return x;
+    }
+    for (final x in _servers) {
+      if (x.host == s.host && x.username == s.username && x.port == s.port) {
+        return x;
+      }
+    }
+    return null;
+  }
+
+  // Після входу паролем — запропонувати ключ (раз; «Не питати» запам'ятовується).
+  Future<void> _maybeOfferKey(TermSession session) async {
+    final s = _stored(session.server);
+    if (s == null || s.keyPath.isNotEmpty || s.password.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final declined = prefs.getStringList(_keyDeclinedPref) ?? [];
+    if (declined.contains(s.id) || !mounted) return;
+    final lc = LC(widget.isDark);
+    final v = await _showTopSheet<String>(
+      (ctx, setLocal) => _dialogCard(
+        ctx,
+        lc,
+        title: 'Входити на ${s.host} ключем?',
+        body: Text(
+            'Lumen допише ключ цього ПК у authorized_keys на сервері й перевірить, '
+            'що він пускає. Пароль лишиться збереженим як запасний вхід.',
+            style: TextStyle(color: lc.dim, fontSize: 12.5)),
+        actions: [
+          _ghostBtn(lc, 'Не питати', () => Navigator.pop(ctx, 'never')),
+          _ghostBtn(lc, 'Не зараз', () => Navigator.pop(ctx, 'later')),
+          const SizedBox(width: 8),
+          _primaryBtn(lc, 'Перейти на ключ', () => Navigator.pop(ctx, 'yes')),
+        ],
+      ),
+    );
+    if (v == 'never') {
+      await prefs.setStringList(_keyDeclinedPref, [...declined, s.id]);
+    } else if (v == 'yes') {
+      await _enableKey(s, via: session);
+    }
+  }
+
+  Future<bool> _enableKey(Server s, {TermSession? via, bool quiet = false}) async {
+    if (!quiet) _toast('Ставлю ключ на ${s.host}…');
+    final err = await KeySwitch.enable(s, via: via);
+    if (err != null) {
+      if (!quiet) _toast('${s.host}: лишаю вхід паролем — $err');
+      return false;
+    }
+    s.keyPath = DeviceKey.ref;
+    via?.server.keyPath = DeviceKey.ref;
+    await _saveServers();
+    await _loadDeviceKey();
+    if (!quiet) _toast('${s.host}: тепер вхід ключем, пароль — запасний');
+    return true;
+  }
+
+  Future<void> _disableKey(Server s) async {
+    _toast('Прибираю ключ із ${s.host}…');
+    final err = await KeySwitch.disable(s);
+    if (err != null) {
+      _toast('${s.host}: ключ не прибрано — $err');
+      return;
+    }
+    s.keyPath = '';
+    await _saveServers();
+    if (mounted) setState(() {});
+    _toast('${s.host}: ключ прибрано, вхід паролем');
+  }
+
+  Future<void> _openServerKeyDialog(Server s) async {
+    final lc = LC(widget.isDark);
+    final uses = DeviceKey.uses(s);
+    final custom = s.keyPath.isNotEmpty && !uses;
+    final v = await _showTopSheet<String>(
+      (ctx, setLocal) => _dialogCard(
+        ctx,
+        lc,
+        title: 'Вхід на ${s.host}',
+        body: Text(
+            uses
+                ? 'Ключ цього ПК (${_devicePub == null ? '—' : DeviceKey.fingerprint(_devicePub!)}). '
+                    'Пароль: ${s.password.isEmpty ? 'не збережено' : 'збережено як запасний'}.'
+                : custom
+                    ? 'Власний ключ: ${s.keyPath}'
+                    : 'Пароль. Ключ цього ПК на сервері не встановлено.',
+            style: TextStyle(color: lc.dim, fontSize: 12.5)),
+        actions: [
+          _ghostBtn(lc, 'Закрити', () => Navigator.pop(ctx)),
+          const SizedBox(width: 8),
+          if (uses)
+            _primaryBtn(lc, 'Прибрати ключ із сервера',
+                () => Navigator.pop(ctx, 'off'))
+          else if (!custom)
+            _primaryBtn(lc, 'Перейти на ключ', () => Navigator.pop(ctx, 'on')),
+        ],
+      ),
+    );
+    if (v == 'on') await _enableKey(s);
+    if (v == 'off') await _disableKey(s);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openDeviceKeyDialog() async {
+    final lc = LC(widget.isDark);
+    final targets = _servers
+        .where((s) => s.keyPath.isEmpty && s.password.isNotEmpty)
+        .toList();
+    final log = ValueNotifier<List<String>>([]);
+    var running = false;
+    await _showTopSheet<void>(
+      (ctx, setLocal) => _dialogCard(
+        ctx,
+        lc,
+        width: 620,
+        title: 'Ключ цього ПК',
+        body: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+                _devicePub == null
+                    ? 'Ключ ще не створено — з\'явиться під час першого переходу на ключ.'
+                    : 'ed25519, ${DeviceKey.fingerprint(_devicePub!)}. Приватна частина '
+                        'зашифрована DPAPI і не лежить окремим файлом.',
+                style: TextStyle(color: lc.dim, fontSize: 12.5)),
+            const SizedBox(height: 8),
+            Text(
+                'Серверів із паролем без ключа: ${targets.length}. На кожен Lumen '
+                'увійде паролем, допише ключ і перевірить вхід ключем; '
+                'де не вийде — лишиться пароль.',
+                style: TextStyle(color: lc.dim, fontSize: 12.5)),
+            const SizedBox(height: 10),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 260),
+              child: ValueListenableBuilder<List<String>>(
+                valueListenable: log,
+                builder: (_, lines, __) => ListView(
+                  shrinkWrap: true,
+                  children: lines
+                      .map((l) => Text(l,
+                          style: TextStyle(
+                              color: lc.text,
+                              fontFamily: 'monospace',
+                              fontSize: 12)))
+                      .toList(),
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          if (_devicePub != null)
+            _ghostBtn(lc, 'Копіювати публічний ключ', () {
+              Clipboard.setData(ClipboardData(text: _devicePub!));
+              _toast('Публічний ключ скопійовано');
+            }),
+          _ghostBtn(lc, 'Закрити', () => Navigator.pop(ctx)),
+          const SizedBox(width: 8),
+          if (targets.isNotEmpty)
+            _primaryBtn(lc, running ? 'Триває…' : 'Перевести всі на ключ', () async {
+              if (running) return;
+              setLocal(() => running = true);
+              var ok = 0;
+              for (final s in targets) {
+                log.value = [...log.value, '${s.host} …'];
+                final err = await KeySwitch.enable(s);
+                if (err == null) {
+                  s.keyPath = DeviceKey.ref;
+                  ok++;
+                  await _saveServers();
+                }
+                log.value = [
+                  ...log.value.sublist(0, log.value.length - 1),
+                  err == null ? '✓ ${s.host}' : '✗ ${s.host}: $err',
+                ];
+              }
+              await _loadDeviceKey();
+              log.value = [...log.value, 'Готово: $ok з ${targets.length} — по ключу.'];
+              targets.removeWhere((s) => s.keyPath.isNotEmpty);
+              if (ctx.mounted) setLocal(() => running = false);
+            }),
+        ],
+      ),
+    );
+    log.dispose();
+    if (mounted) setState(() {});
+  }
+
   Future<void> _openBatchDialog() async {
     final s = _active;
     if (s == null) {
@@ -1318,6 +1509,9 @@ class _HomePageState extends State<HomePage> {
             case 'master':
               _setupMaster();
               break;
+            case 'devkey':
+              _openDeviceKeyDialog();
+              break;
             case 'accent':
               _openAccentDialog();
               break;
@@ -1333,6 +1527,7 @@ class _HomePageState extends State<HomePage> {
           _toolItem(lc, 'monitor', 'activity', 'Монітор системи'),
           _toolItem(lc, 'tunnels', 'network', 'Проброс портів (тунелі)'),
           _toolItem(lc, 'keygen', 'key', 'Генерація SSH-ключа'),
+          _toolItem(lc, 'devkey', 'key', 'Ключ цього ПК і перехід на ключі'),
           _toolItem(lc, 'master', 'lock',
               _masterEnabled ? 'Майстер-пароль ✓' : 'Майстер-пароль'),
           _toolItem(lc, 'accent', 'palette', 'Акцентний колір'),
@@ -1961,6 +2156,21 @@ class _HomePageState extends State<HomePage> {
                   ),
                   Text('${s.username}@${s.host}',
                       style: TextStyle(color: lc.dim, fontSize: 10.5)),
+                  InkWell(
+                    onTap: () => _openServerKeyDialog(s),
+                    borderRadius: BorderRadius.circular(4),
+                    child: Tooltip(
+                      message: DeviceKey.uses(s)
+                          ? 'Вхід ключем цього ПК'
+                          : 'Вхід паролем — перейти на ключ',
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: AppIcon(DeviceKey.uses(s) ? 'key' : 'lock',
+                            size: 15,
+                            color: DeviceKey.uses(s) ? lc.accent : lc.dim),
+                      ),
+                    ),
+                  ),
                   _rowIcon(lc, 'pencil', () => _openConnectDialog(s)),
                   _rowIcon(lc, 'trash', () => _deleteServer(s)),
                 ],

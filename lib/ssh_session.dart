@@ -7,6 +7,7 @@ import 'package:dartssh2/dartssh2.dart';
 import 'package:xterm/xterm.dart';
 
 import 'server.dart';
+import 'device_key.dart';
 
 /// Метрики навантаження сервера для нижньої панелі.
 class Metrics {
@@ -105,12 +106,17 @@ class TermSession {
         timeout: const Duration(seconds: 20));
   }
 
-  Future<void> connect() async {
+  /// Сокет і автентифікований клієнт, без shell. Звичайно — спершу ключ, потім
+  /// пароль; [keyOnly] перевіряє, що сервер пускає саме ключем, [passwordOnly]
+  /// входить лише паролем (щоб поставити ключ туди, де його ще немає).
+  Future<void> open({bool keyOnly = false, bool passwordOnly = false}) async {
     final socket = await _openSocket();
 
     List<SSHKeyPair> identities = [];
-    if (server.keyPath.isNotEmpty) {
-      final pem = await File(server.keyPath).readAsString();
+    if (server.keyPath.isNotEmpty && !passwordOnly) {
+      final pem = DeviceKey.uses(server)
+          ? await DeviceKey.privatePem()
+          : await File(server.keyPath).readAsString();
       identities = SSHKeyPair.fromPem(
         pem,
         server.passphrase.isEmpty ? null : server.passphrase,
@@ -121,8 +127,27 @@ class TermSession {
       socket,
       username: server.username,
       identities: identities,
-      onPasswordRequest: () => server.password,
+      onPasswordRequest: keyOnly ? null : () => server.password,
     );
+    await _client!.authenticated;
+  }
+
+  /// Виконати shell-скрипт через `sh -s` (stdin), повернути stdout.
+  Future<String> runScript(String script) async {
+    final s = await _client!.execute('sh -s');
+    s.stdin.add(utf8.encode(script));
+    await s.stdin.close();
+    s.stderr.drain<void>();
+    final out = await s.stdout
+        .cast<List<int>>()
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
+    await s.done;
+    return out;
+  }
+
+  Future<void> connect() async {
+    await open();
 
     // TerminalView підганяє розмір терміналу ще до підключення, тому PTY
     // відкриваємо одразу з реальним розміром (а не 80x24) — інакше bash
